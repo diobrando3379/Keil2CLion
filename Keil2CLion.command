@@ -52,6 +52,23 @@ sub blocks {
     return $text =~ m{<\Q$tag\E>(.*?)</\Q$tag\E>}sg;
 }
 
+# Top-level <Target> blocks; older projects also nest a <Target> element in the debug options
+sub top_level_targets {
+    my ($text) = @_;
+    my (@found, $start);
+    my $depth = 0;
+    while ($text =~ m{<(/?)Target>}g) {
+        if ($1 eq '') {
+            $start = pos($text) if $depth == 0;
+            $depth++;
+        } else {
+            $depth--;
+            push @found, substr($text, $start, pos($text) - length('</Target>') - $start) if $depth == 0;
+        }
+    }
+    return @found;
+}
+
 sub opt {
     my ($node, $path) = @_;
     for my $tag (split m{/}, $path) {
@@ -131,6 +148,22 @@ sub remove_keil_files {
     print "  已清理 Keil 中间文件，回到 Keil 后第一次会全部重新编译\n" if $removed;
 }
 
+# The device macro Keil's device pack adds by itself, worked out from the startup file's name:
+#   startup_stm32f10x_md.s -> STM32F10X_MD    startup_stm32f103xb.s -> STM32F103xB
+#   startup_stm32f40_41xxx.s -> STM32F40_41xxx    startup_gd32f30x_hd.s -> GD32F30X_HD    startup_ARMCM4.s -> ARMCM4
+# Family-wide names such as startup_stm32f0xx.s do not say which macro is needed, so they give none.
+sub device_define {
+    my ($startup, @defines) = @_;
+    return '' if grep { /^(STM32|GD32|ARMCM|ARMSC)/i } @defines;
+    return $1 if $startup =~ /^startup_(ARM(?:CM|SC)\w+)\.[sS]$/;
+    return '' unless $startup =~ /^startup_((?:stm32|gd32)\w+)\.s$/i;
+    my $n = uc($1);
+    return '' if $n =~ /^(STM32|GD32)[A-Z]\d(XX|\dX)$/;
+    return $n if $n =~ /^(STM32F10X|STM32L1XX|GD32F\d0X)_/;
+    return $n =~ s/X/x/gr if $n =~ /^STM32/;
+    return '';
+}
+
 # Keil startup file -> GNU assembler startup file, keeping its vector table and stack/heap sizes
 sub convert_startup {
     my ($path) = @_;
@@ -146,18 +179,21 @@ sub convert_startup {
     for my $line (@lines) {
         $in_table = 1 if $line =~ /^__Vectors\s+DCD/i;
         last if $line =~ /^__Vectors_End/i;
-        push @vectors, $1 if $in_table && $line =~ /\bDCD\s+(\w+)/i;
+        next unless $in_table;
+        if ($line =~ /\bDCD\s+(\w+)/i) { push @vectors, $1; }
+        elsif ($line =~ /\bSPACE\s+([\d\s*()]+?)\s*$/i) { push @vectors, "SPACE:$1"; }
     }
     if (@vectors < 16 || $vectors[0] ne '__initial_sp' || $vectors[1] ne 'Reset_Handler') {
         die "启动文件的向量表格式不认识: $path\n";
     }
 
-    my (@table, @weak);
+    my (@table, @weak, %listed);
     for my $v (@vectors) {
         if ($v eq '__initial_sp') { push @table, '    .word _estack'; next; }
         if ($v eq '0') { push @table, '    .word 0'; next; }
+        if ($v =~ /^SPACE:(.*)$/) { push @table, "    .space $1"; next; }
         push @table, "    .word $v";
-        push @weak, "    .weak $v\n    .thumb_set $v, Default_Handler" if $v ne 'Reset_Handler';
+        push @weak, "    .weak $v\n    .thumb_set $v, Default_Handler" if $v ne 'Reset_Handler' && !$listed{$v}++;
     }
 
     my $s = <<'END';
@@ -167,10 +203,15 @@ sub convert_startup {
     .thumb
 
     .section .isr_vector, "a", %progbits
-    .type g_pfnVectors, %object
-g_pfnVectors:
+    .global __Vectors
+    .global __Vectors_End
+    .global __Vectors_Size
+    .type __Vectors, %object
+__Vectors:
 {TABLE}
-    .size g_pfnVectors, . - g_pfnVectors
+__Vectors_End:
+    .size __Vectors, . - __Vectors
+    .set __Vectors_Size, __Vectors_End - __Vectors
 
     .section .text.Reset_Handler, "ax", %progbits
     .weak Reset_Handler
@@ -179,22 +220,25 @@ Reset_Handler:
     ldr r0, =_sdata
     ldr r1, =_edata
     ldr r2, =_sidata
-1:  cmp r0, r1
-    ittt lo
-    ldrlo r3, [r2], #4
-    strlo r3, [r0], #4
+    b 2f
+1:  ldr r3, [r2]
+    str r3, [r0]
+    adds r0, #4
+    adds r2, #4
+2:  cmp r0, r1
     blo 1b
     ldr r0, =_sbss
     ldr r1, =_ebss
     movs r2, #0
-2:  cmp r0, r1
-    itt lo
-    strlo r2, [r0], #4
-    blo 2b
+    b 4f
+3:  str r2, [r0]
+    adds r0, #4
+4:  cmp r0, r1
+    blo 3b
     bl SystemInit
     bl __libc_init_array
     bl main
-3:  b 3b
+5:  b 5b
     .size Reset_Handler, . - Reset_Handler
 
     .section .text.Default_Handler, "ax", %progbits
@@ -224,7 +268,7 @@ sub convert_project {
         my $encoding = $1;
         eval { Encode::from_to($xml, $encoding, 'utf-8'); 1 } or die "不认识工程文件的编码: $encoding\n";
     }
-    my @targets = blocks(block($xml, 'Targets'), 'Target');
+    my @targets = top_level_targets($xml);
     die "工程里没有 Target。\n" unless @targets;
     print "  注意: 有多个 Target，使用第一个\n" if @targets > 1;
     my $t = $targets[0];
@@ -250,14 +294,25 @@ sub convert_project {
     my $cpu_str = opt($t, 'TargetOption/TargetCommonOption/Cpu');
     $cpu_str =~ /CPUTYPE\("([^"]+)"\)/i or die "读不出 CPU 型号: $cpu_str\n";
     my $cpu = lc($1);
+    die "只支持 Cortex-M 内核，这个工程是 $cpu。\n" unless $cpu =~ /^cortex-m/;
+    $cpu =~ s/\+/plus/g;
     my $arch = "-mcpu=$cpu -mthumb";
-    $arch .= ' -mfpu=fpv4-sp-d16 -mfloat-abi=hard' if $cpu_str =~ /FPU2/i;
+    my $ads = 'TargetOption/TargetArmAds';
+
+    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision
+    my $fpu_setting = opt($t, "$ads/ArmAdsMisc/RvdsVP");
+    if ($fpu_setting eq '2' || $fpu_setting eq '3') {
+        my $fpu = 'auto';
+        $fpu = 'fpv4-sp-d16' if $cpu eq 'cortex-m4';
+        $fpu = $fpu_setting eq '3' ? 'fpv5-d16' : 'fpv5-sp-d16' if $cpu eq 'cortex-m7';
+        $arch .= " -mfpu=$fpu -mfloat-abi=hard";
+    }
 
     # Memory layout from Options for Target > Target
-    my $ads = 'TargetOption/TargetArmAds';
     my $mem = "$ads/ArmAdsMisc/OnChipMemories";
     my $rom_base = opt($t, "$mem/OCR_RVCT4/StartAddress"); my $rom_size = opt($t, "$mem/OCR_RVCT4/Size");
     my $ram_base = opt($t, "$mem/OCR_RVCT9/StartAddress"); my $ram_size = opt($t, "$mem/OCR_RVCT9/Size");
+    die "读不出 Flash 或 RAM 的地址，请检查 Options for Target 的 Target 页。\n" if grep { $_ eq '' || lc($_) eq '0x0' } $rom_size, $ram_size;
     if (opt($t, "$ads/LDads/umfTarg") eq '0' && opt($t, "$ads/LDads/ScatterFile") ne '') {
         print "  注意: 工程用了自定义 .sct，GCC 用不了，已按 Target 页的内存布局生成链接脚本\n";
     }
@@ -266,7 +321,7 @@ sub convert_project {
     my @c_opt = ('-g', '-ffunction-sections', '-fdata-sections');
     my %levels = (1 => '-O0', 2 => '-O1', 3 => '-O2', 4 => '-O3');
     push @c_opt, $levels{opt($t, "$ads/Cads/Optim")} // '-O2';
-    push @c_opt, opt($t, "$ads/Cads/uC99") eq '1' ? '-std=gnu99' : '-std=gnu90';
+    push @c_opt, opt($t, 'uAC6') eq '1' ? '-std=gnu11' : opt($t, "$ads/Cads/uC99") eq '1' ? '-std=gnu99' : '-std=gnu90';
     push @c_opt, '-fshort-enums' if opt($t, "$ads/Cads/EnumInt") eq '0';
     push @c_opt, opt($t, "$ads/Cads/PlainCh") eq '1' ? '-fsigned-char' : '-funsigned-char';
     my $w_level = opt($t, "$ads/Cads/wLevel");
@@ -274,12 +329,19 @@ sub convert_project {
     push @c_opt, '-Wall' if $w_level eq '2';
     print "  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略\n" if opt($t, "$ads/Cads/VariousControls/MiscControls") ne '';
 
-    # Defines: Keil adds the density macro itself, it is not in the project's Define box
+    # Defines: Keil adds the device macro itself, it is not in the project's Define box
     my $startup_path = "$dir/$asm_src[0]";
-    my @defs = split_semi(opt($t, "$ads/Cads/VariousControls/Define"));
-    push @defs, 'STM32F10X_' . uc($1) if basename($startup_path) =~ /^startup_stm32f10x_(\w+)\.s$/i;
     my %seen;
-    @defs = grep { !$seen{$_}++ } @defs;
+    my @defs = grep { !$seen{$_}++ } split_semi(opt($t, "$ads/Cads/VariousControls/Define"));
+    my $device_define = device_define(basename($startup_path), @defs);
+    my $device_block = '';
+    if ($device_define ne '') {
+        $device_block = "# Added by Keil's device pack, so it is not in the project's Define box\nset(KEIL_DEVICE_DEFINE $device_define)\n\n";
+    } elsif (!grep { /^(STM32|GD32|ARMCM|ARMSC)/i } @defs) {
+        print "  注意: 没能从 " . basename($startup_path) . " 判断型号宏。如果编译时报缺少器件宏，请在 Keil 的 Define 框里加上，比如 STM32F407xx\n";
+    }
+    my @shown_defs = (@defs, $device_define ne '' ? ($device_define) : ());
+    push @defs, '${KEIL_DEVICE_DEFINE}' if $device_define ne '';
     my @incs = map { '${CMAKE_CURRENT_SOURCE_DIR}/' . rel_path($_) } split_semi(opt($t, "$ads/Cads/VariousControls/IncludePath"));
 
     my $name = opt($t, 'TargetOption/TargetCommonOption/OutputName');
@@ -308,13 +370,14 @@ sub convert_project {
     write_file("$cmake_dir/startup_gcc.s", fill($startup, MARKER => $Marker, CPU => $cpu));
     my @src_list = ('cmake/startup_gcc.s');
 
-    # core_cm3.c: its STREX inline assembly lets GCC use the same register twice, which the assembler rejects
+    # core_cmN.c: its STREX inline assembly lets GCC use the same register twice, which the assembler rejects
     for my $c (@c_src) {
-        if (lc(basename($c)) eq 'core_cm3.c') {
+        if (basename($c) =~ /^(core_cm\d+)\.c$/i) {
+            my $core_name = lc($1) . '_gcc.c';
             my $core = read_file("$dir/$c");
             $core =~ s/(strex[bh]?\s+%0[^\n]*?)"=r"/$1"=&r"/g;
-            write_file("$cmake_dir/core_cm3_gcc.c", "/* $Marker from $c */\n" . $core);
-            push @src_list, 'cmake/core_cm3_gcc.c';
+            write_file("$cmake_dir/$core_name", "/* $Marker from $c */\n" . $core);
+            push @src_list, "cmake/$core_name";
         } else {
             push @src_list, $c;
         }
@@ -517,7 +580,7 @@ endif()
 
 project({TARGET} LANGUAGES C ASM)
 
-# Build settings come from the Keil project, whichever CLion profile is selected
+{DEVICE}# Build settings come from the Keil project, whichever CLion profile is selected
 foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     set(CMAKE_C_FLAGS_${cfg} "")
     set(CMAKE_ASM_FLAGS_${cfg} "")
@@ -550,10 +613,10 @@ add_custom_command(TARGET {TARGET} POST_BUILD
 )
 END
     write_file($out_file, fill($cmake,
-        MARKER => $Marker, UVPROJX => $uv[0], TARGET => $target, NAME => $name,
+        MARKER => $Marker, UVPROJX => $uv[0], TARGET => $target, NAME => $name, DEVICE => $device_block,
         SRC => $fmt->(@src_list), INCS => $fmt_c->(@incs), DEFS => $fmt_c->(@defs), COPT => $fmt_c->(@c_opt), LOPT => $fmt->(@link_opt)));
 
-    print "  完成: " . scalar(@c_src) . " 个 C 文件, CPU $cpu, 宏 @defs\n";
+    print "  完成: " . scalar(@c_src) . " 个 C 文件, CPU $cpu, 宏 @shown_defs\n";
 }
 
 # Double-clicking a .command starts in the home folder, so fall back to this file's own folder

@@ -26,6 +26,24 @@ function Get-Tag($text, $tag) {
     return ''
 }
 
+# Top-level <Target> blocks; older projects also nest a <Target> element in the debug options
+function Get-Targets($text) {
+    $depth = 0
+    $start = 0
+    foreach ($m in [regex]::Matches($text, '</?Target>')) {
+        if ($m.Value -eq '<Target>') {
+            if ($depth -eq 0) { $start = $m.Index }
+            $depth++
+        } else {
+            $depth--
+            if ($depth -eq 0) {
+                $length = $m.Index + $m.Length - $start
+                [pscustomobject]@{ Index = $start; Length = $length; Value = $text.Substring($start, $length) }
+            }
+        }
+    }
+}
+
 function Get-Key($path) {
     $p = ($path -replace '\\', '/') -replace '^(\./)+', ''
     $p = $p.TrimEnd('/')
@@ -93,9 +111,10 @@ function Sync-Project($dir, $cmakeText) {
     if ($prj -match '^.*?encoding="([^"]+)"') { $encoding = [Text.Encoding]::GetEncoding($Matches[1]) }
     $nl = if ($prj.Contains("`r`n")) { "`r`n" } else { "`n" }
 
-    $targetMatch = [regex]::Match($prj, '(?s)<Target>.*?</Target>')
-    if (-not $targetMatch.Success) { throw '工程里没有 Target。' }
-    if ([regex]::Matches($prj, '(?s)<Target>.*?</Target>').Count -gt 1) { Write-Host '  注意: 有多个 Target，只同步第一个' }
+    $targets = @(Get-Targets $prj)
+    if (-not $targets) { throw '工程里没有 Target。' }
+    if ($targets.Count -gt 1) { Write-Host '  注意: 有多个 Target，只同步第一个' }
+    $targetMatch = $targets[0]
     $target = $targetMatch.Value
 
     # What Keil lists now
@@ -114,7 +133,7 @@ function Sync-Project($dir, $cmakeText) {
     $cmakeKeys = @{}
     $usesCore = $false
     foreach ($s in $cmakeSources) {
-        if ((Get-Key $s) -eq 'cmake/core_cm3_gcc.c') { $usesCore = $true }
+        if ((Get-Key $s) -match '^cmake/core_cm\d+_gcc\.c$') { $usesCore = $true }
         if ((Get-Key $s) -notmatch '^cmake/') { $cmakeKeys[(Get-Key $s)] = $s }
     }
 
@@ -140,7 +159,7 @@ function Sync-Project($dir, $cmakeText) {
     foreach ($key in $keilFiles.Keys) {
         $info = $keilFiles[$key]
         if ($info.Type -eq '2') { continue }
-        if ($usesCore -and $key -match '(^|/)core_cm3\.c$') { continue }
+        if ($usesCore -and $key -match '(^|/)core_cm\d+\.c$') { continue }
         $gone = -not (Test-Path -LiteralPath (Join-Path $dir ($info.Path -replace '\\', '/')))
         if ($gone -or ($info.Type -eq '1' -and -not $cmakeKeys.ContainsKey($key))) { $toRemove[$key] = $true }
     }
@@ -164,7 +183,8 @@ function Sync-Project($dir, $cmakeText) {
     # Defines and include paths
     $cads = [regex]::Match($target, '(?s)<Cads>.*?</Cads>').Value
     $keilDefines = @(((Get-Tag $cads 'Define') -split '[;,]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $cmakeDefines = @(Get-CMakeArgs $cmakeText 'target_compile_definitions' | Where-Object { $_ -notmatch '^STM32F10X_(LD|LD_VL|MD|MD_VL|HD|HD_VL|XL|CL)$' })
+    # The device macro comes from Keil's device pack, so it never goes in the Define box (older CMakeLists.txt list it directly)
+    $cmakeDefines = @(Get-CMakeArgs $cmakeText 'target_compile_definitions' | Where-Object { $_ -ne '${KEIL_DEVICE_DEFINE}' -and $_ -notmatch '^STM32F10X_(LD|LD_VL|MD|MD_VL|HD|HD_VL|XL|CL)$' })
     $newDefines = @($keilDefines | Where-Object { $cmakeDefines -contains $_ })
     $newDefines += @($cmakeDefines | Where-Object { $keilDefines -notcontains $_ } | Select-Object -Unique)
     $definesChanged = (@($newDefines) -join ',') -ne (@($keilDefines) -join ',')
@@ -203,10 +223,14 @@ function Sync-Project($dir, $cmakeText) {
             foreach ($g in [regex]::Matches($newTarget, '(?s)<Group>.*?</Group>')) {
                 if ((Get-Tag $g.Value 'GroupName') -eq $groupName) { $groupMatch = $g; break }
             }
-            if ($groupMatch) {
+            if ($groupMatch -and $groupMatch.Value.Contains('</Files>')) {
                 $at = $groupMatch.Index + $groupMatch.Value.LastIndexOf('</Files>')
                 $lineStart = $newTarget.LastIndexOf("`n", $at) + 1
                 $newTarget = $newTarget.Insert($lineStart, $entry + $nl)
+            } elseif ($groupMatch) {
+                $at = $groupMatch.Index + $groupMatch.Value.LastIndexOf('</Group>')
+                $lineStart = $newTarget.LastIndexOf("`n", $at) + 1
+                $newTarget = $newTarget.Insert($lineStart, "          <Files>$nl$entry$nl          </Files>$nl")
             } else {
                 $block = @("        <Group>", "          <GroupName>$groupName</GroupName>", "          <Files>", $entry, "          </Files>", "        </Group>") -join $nl
                 $at = $newTarget.LastIndexOf('</Groups>')

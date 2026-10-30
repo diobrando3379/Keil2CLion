@@ -75,6 +75,21 @@ function Remove-KeilFiles($dir) {
     if ($removed) { Write-Host '  已清理 Keil 中间文件，回到 Keil 后第一次会全部重新编译' }
 }
 
+# The device macro Keil's device pack adds by itself, worked out from the startup file's name:
+#   startup_stm32f10x_md.s -> STM32F10X_MD    startup_stm32f103xb.s -> STM32F103xB
+#   startup_stm32f40_41xxx.s -> STM32F40_41xxx    startup_gd32f30x_hd.s -> GD32F30X_HD    startup_ARMCM4.s -> ARMCM4
+# Family-wide names such as startup_stm32f0xx.s do not say which macro is needed, so they give none.
+function Get-DeviceDefine($startup, $defines) {
+    if (@($defines | Where-Object { $_ -match '^(STM32|GD32|ARMCM|ARMSC)' }).Count) { return '' }
+    if ($startup -cmatch '^startup_(ARM(CM|SC)\w+)\.[sS]$') { return $Matches[1] }
+    if ($startup -notmatch '^startup_((stm32|gd32)\w+)\.s$') { return '' }
+    $n = $Matches[1].ToUpper()
+    if ($n -match '^(STM32|GD32)[A-Z]\d(XX|\dX)$') { return '' }
+    if ($n -match '^(STM32F10X|STM32L1XX|GD32F\d0X)_') { return $n }
+    if ($n -match '^STM32') { return ($n -creplace 'X', 'x') }
+    return ''
+}
+
 # Keil startup file -> GNU assembler startup file, keeping its vector table and stack/heap sizes
 function Convert-Startup($path) {
     $lines = [IO.File]::ReadAllLines($path, $Latin1) | ForEach-Object { ($_ -split ';')[0] }
@@ -90,6 +105,7 @@ function Convert-Startup($path) {
         if ($l -match '^__Vectors\s+DCD') { $inTable = $true }
         if ($l -match '^__Vectors_End') { break }
         if ($inTable -and $l -match '\bDCD\s+(\w+)') { $vectors += $Matches[1] }
+        elseif ($inTable -and $l -match '\bSPACE\s+([\d\s*()]+?)\s*$') { $vectors += "SPACE:$($Matches[1])" }
     }
     if ($vectors.Count -lt 16 -or $vectors[0] -ne '__initial_sp' -or $vectors[1] -ne 'Reset_Handler') {
         throw "启动文件的向量表格式不认识: $path"
@@ -97,14 +113,12 @@ function Convert-Startup($path) {
 
     $table = @(); $weak = @()
     foreach ($v in $vectors) {
-        switch ($v) {
-            '__initial_sp' { $table += '    .word _estack' }
-            '0' { $table += '    .word 0' }
-            default {
-                $table += "    .word $v"
-                if ($v -ne 'Reset_Handler') { $weak += "    .weak $v`n    .thumb_set $v, Default_Handler" }
-            }
-        }
+        if ($v -eq '__initial_sp') { $table += '    .word _estack'; continue }
+        if ($v -eq '0') { $table += '    .word 0'; continue }
+        if ($v.StartsWith('SPACE:')) { $table += "    .space $($v.Substring(6))"; continue }
+        $table += "    .word $v"
+        $entry = "    .weak $v`n    .thumb_set $v, Default_Handler"
+        if ($v -ne 'Reset_Handler' -and $weak -notcontains $entry) { $weak += $entry }
     }
 
     $s = @'
@@ -114,10 +128,15 @@ function Convert-Startup($path) {
     .thumb
 
     .section .isr_vector, "a", %progbits
-    .type g_pfnVectors, %object
-g_pfnVectors:
+    .global __Vectors
+    .global __Vectors_End
+    .global __Vectors_Size
+    .type __Vectors, %object
+__Vectors:
 {TABLE}
-    .size g_pfnVectors, . - g_pfnVectors
+__Vectors_End:
+    .size __Vectors, . - __Vectors
+    .set __Vectors_Size, __Vectors_End - __Vectors
 
     .section .text.Reset_Handler, "ax", %progbits
     .weak Reset_Handler
@@ -126,22 +145,25 @@ Reset_Handler:
     ldr r0, =_sdata
     ldr r1, =_edata
     ldr r2, =_sidata
-1:  cmp r0, r1
-    ittt lo
-    ldrlo r3, [r2], #4
-    strlo r3, [r0], #4
+    b 2f
+1:  ldr r3, [r2]
+    str r3, [r0]
+    adds r0, #4
+    adds r2, #4
+2:  cmp r0, r1
     blo 1b
     ldr r0, =_sbss
     ldr r1, =_ebss
     movs r2, #0
-2:  cmp r0, r1
-    itt lo
-    strlo r2, [r0], #4
-    blo 2b
+    b 4f
+3:  str r2, [r0]
+    adds r0, #4
+4:  cmp r0, r1
+    blo 3b
     bl SystemInit
     bl __libc_init_array
     bl main
-3:  b 3b
+5:  b 5b
     .size Reset_Handler, . - Reset_Handler
 
     .section .text.Default_Handler, "ax", %progbits
@@ -195,14 +217,25 @@ function Convert-Project($dir) {
     $cpuStr = Get-Opt $t 'TargetOption/TargetCommonOption/Cpu'
     if ($cpuStr -notmatch 'CPUTYPE\("([^"]+)"\)') { throw "读不出 CPU 型号: $cpuStr" }
     $cpu = $Matches[1].ToLower()
+    if ($cpu -notmatch '^cortex-m') { throw "只支持 Cortex-M 内核，这个工程是 $cpu。" }
+    $cpu = $cpu.Replace('+', 'plus')
     $archFlags = "-mcpu=$cpu -mthumb"
-    if ($cpuStr -match 'FPU2') { $archFlags += ' -mfpu=fpv4-sp-d16 -mfloat-abi=hard' }
+    $ads = 'TargetOption/TargetArmAds'
+
+    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision
+    $fpuSetting = Get-Opt $t "$ads/ArmAdsMisc/RvdsVP"
+    if ($fpuSetting -in '2', '3') {
+        $fpu = 'auto'
+        if ($cpu -eq 'cortex-m4') { $fpu = 'fpv4-sp-d16' }
+        if ($cpu -eq 'cortex-m7') { $fpu = if ($fpuSetting -eq '3') { 'fpv5-d16' } else { 'fpv5-sp-d16' } }
+        $archFlags += " -mfpu=$fpu -mfloat-abi=hard"
+    }
 
     # Memory layout from Options for Target > Target
-    $ads = 'TargetOption/TargetArmAds'
     $mem = "$ads/ArmAdsMisc/OnChipMemories"
     $romBase = Get-Opt $t "$mem/OCR_RVCT4/StartAddress"; $romSize = Get-Opt $t "$mem/OCR_RVCT4/Size"
     $ramBase = Get-Opt $t "$mem/OCR_RVCT9/StartAddress"; $ramSize = Get-Opt $t "$mem/OCR_RVCT9/Size"
+    if ($romSize -in '', '0x0' -or $ramSize -in '', '0x0') { throw '读不出 Flash 或 RAM 的地址，请检查 Options for Target 的 Target 页。' }
     if ((Get-Opt $t "$ads/LDads/umfTarg") -eq '0' -and (Get-Opt $t "$ads/LDads/ScatterFile")) {
         Write-Host '  注意: 工程用了自定义 .sct，GCC 用不了，已按 Target 页的内存布局生成链接脚本'
     }
@@ -210,17 +243,25 @@ function Convert-Project($dir) {
     # C options
     $cOpt = @('-g', '-ffunction-sections', '-fdata-sections')
     switch (Get-Opt $t "$ads/Cads/Optim") { '1' { $cOpt += '-O0' } '2' { $cOpt += '-O1' } '3' { $cOpt += '-O2' } '4' { $cOpt += '-O3' } default { $cOpt += '-O2' } }
-    if ((Get-Opt $t "$ads/Cads/uC99") -eq '1') { $cOpt += '-std=gnu99' } else { $cOpt += '-std=gnu90' }
+    if ((Get-Opt $t 'uAC6') -eq '1') { $cOpt += '-std=gnu11' }
+    elseif ((Get-Opt $t "$ads/Cads/uC99") -eq '1') { $cOpt += '-std=gnu99' }
+    else { $cOpt += '-std=gnu90' }
     if ((Get-Opt $t "$ads/Cads/EnumInt") -eq '0') { $cOpt += '-fshort-enums' }
     if ((Get-Opt $t "$ads/Cads/PlainCh") -eq '1') { $cOpt += '-fsigned-char' } else { $cOpt += '-funsigned-char' }
     switch (Get-Opt $t "$ads/Cads/wLevel") { '1' { $cOpt += '-w' } '2' { $cOpt += '-Wall' } }
     if (Get-Opt $t "$ads/Cads/VariousControls/MiscControls") { Write-Host '  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略' }
 
-    # Defines: Keil adds the density macro itself, it is not in the project's Define box
+    # Defines: Keil adds the device macro itself, it is not in the project's Define box
     $startupPath = Join-Path $dir $asmSrc[0]
-    $defs = @(Split-Semi (Get-Opt $t "$ads/Cads/VariousControls/Define"))
-    if ((Split-Path $startupPath -Leaf) -match '^startup_stm32f10x_(\w+)\.s$') { $defs += "STM32F10X_$($Matches[1].ToUpper())" }
-    $defs = @($defs | Select-Object -Unique)
+    $defs = @(Split-Semi (Get-Opt $t "$ads/Cads/VariousControls/Define") | Select-Object -Unique)
+    $deviceDefine = Get-DeviceDefine (Split-Path $startupPath -Leaf) $defs
+    $deviceBlock = ''
+    if ($deviceDefine) {
+        $deviceBlock = "# Added by Keil's device pack, so it is not in the project's Define box`nset(KEIL_DEVICE_DEFINE $deviceDefine)`n`n"
+        $defs += '${KEIL_DEVICE_DEFINE}'
+    } elseif (-not @($defs | Where-Object { $_ -match '^(STM32|GD32|ARMCM|ARMSC)' }).Count) {
+        Write-Host "  注意: 没能从 $(Split-Path $startupPath -Leaf) 判断型号宏。如果编译时报缺少器件宏，请在 Keil 的 Define 框里加上，比如 STM32F407xx"
+    }
     $incs = @(Split-Semi (Get-Opt $t "$ads/Cads/VariousControls/IncludePath") | ForEach-Object { '${CMAKE_CURRENT_SOURCE_DIR}/' + (Get-RelPath $_) })
 
     $name = Get-Opt $t 'TargetOption/TargetCommonOption/OutputName'
@@ -251,13 +292,14 @@ function Convert-Project($dir) {
     Save-Text (Join-Path $cmakeDir 'startup_gcc.s') $startup.Text.Replace('{MARKER}', $Marker).Replace('{CPU}', $cpu)
     $srcList = @('cmake/startup_gcc.s')
 
-    # core_cm3.c: its STREX inline assembly lets GCC use the same register twice, which the assembler rejects
+    # core_cmN.c: its STREX inline assembly lets GCC use the same register twice, which the assembler rejects
     foreach ($c in $cSrc) {
-        if ((Split-Path $c -Leaf) -ieq 'core_cm3.c') {
+        if ((Split-Path $c -Leaf) -match '^(core_cm\d+)\.c$') {
+            $coreName = "$($Matches[1].ToLower())_gcc.c"
             $coreText = [IO.File]::ReadAllText((Join-Path $dir $c), $Latin1)
             $coreText = [regex]::Replace($coreText, '(strex[bh]?\s+%0[^\n]*?)"=r"', '$1"=&r"')
-            [IO.File]::WriteAllText((Join-Path $cmakeDir 'core_cm3_gcc.c'), "/* $Marker from $c */`n" + $coreText, $Latin1)
-            $srcList += 'cmake/core_cm3_gcc.c'
+            [IO.File]::WriteAllText((Join-Path $cmakeDir $coreName), "/* $Marker from $c */`n" + $coreText, $Latin1)
+            $srcList += "cmake/$coreName"
         } else {
             $srcList += $c
         }
@@ -460,7 +502,7 @@ endif()
 
 project({TARGET} LANGUAGES C ASM)
 
-# Build settings come from the Keil project, whichever CLion profile is selected
+{DEVICE}# Build settings come from the Keil project, whichever CLion profile is selected
 foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     set(CMAKE_C_FLAGS_${cfg} "")
     set(CMAKE_ASM_FLAGS_${cfg} "")
@@ -492,11 +534,11 @@ add_custom_command(TARGET {TARGET} POST_BUILD
     COMMENT "Creating {NAME}.hex"
 )
 '@
-    $cmakeText = $cmakeText.Replace('{MARKER}', $Marker).Replace('{UVPROJX}', $uv[0].Name).Replace('{TARGET}', $target).Replace('{NAME}', $name)
+    $cmakeText = $cmakeText.Replace('{MARKER}', $Marker).Replace('{UVPROJX}', $uv[0].Name).Replace('{TARGET}', $target).Replace('{NAME}', $name).Replace('{DEVICE}', $deviceBlock)
     $cmakeText = $cmakeText.Replace('{SRC}', (Fmt $srcList)).Replace('{INCS}', (FmtC $incs)).Replace('{DEFS}', (FmtC $defs)).Replace('{COPT}', (FmtC $cOpt)).Replace('{LOPT}', (Fmt $linkOpt))
     Save-Text $outFile $cmakeText
 
-    Write-Host "  完成: $($cSrc.Count) 个 C 文件, CPU $cpu, 宏 $($defs -join ' ')"
+    Write-Host "  完成: $($cSrc.Count) 个 C 文件, CPU $cpu, 宏 $((@($defs | Where-Object { $_ -notmatch '^\$' }) + $deviceDefine | Where-Object { $_ }) -join ' ')"
 }
 
 try {

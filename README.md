@@ -68,14 +68,16 @@ sh Keil2CLion.command /path/to/工程文件夹
 - **语法差异：** `0b101`、`typeof`、语句表达式 `({ ... })` 能用 GCC 编译，但 Keil 的 ARMCC 会报错。
 - **文件名：** 用英文。ARMCC 打不开中文文件名。
 - **串口 `printf`：** 继续写 `fputc`，不要改成 `_write`。
+- **型号宏：** Keil 芯片包自动加的宏（如 `STM32F10X_MD`）会根据启动文件名推导，规则见[使用说明](使用说明.md#型号宏)。推导不出时脚本会提示，在 Keil 的 Define 框里手动加上即可。
 - **编译结果不同：** 两个编译器生成的程序不一样，时序敏感的功能要分别验证。
 - **`cmake/` 里的文件都是生成的：** 手动修改不会同步回 Keil，转回时还会被删除。
 
 ## 限制
 
-- 只支持 ARM Compiler 5 的 Keil 工程，转回 Keil 也要用 ARMCC 编译。
-- 型号宏只能根据启动文件自动识别 STM32F10x 系列。
+- 只支持 Cortex-M 内核，工程里要有 ARM 语法的启动文件（`.s`）。由 Keil RTE 管理的启动文件读不到。
+- 主要面向 ARM Compiler 5 工程。AC6 工程只做了基本适配，没有测试过。
 - 不支持 C++ 源文件，也不能使用 Keil 编译好的 `.lib`、`.o`。
+- 只生成一段 Flash 和一段 RAM，Keil 里的 IRAM2、CCM 等额外内存不会写进链接脚本。
 - `CLion2Keil` 目前只有 Windows 版。
 - 没有配置 CLion 里的烧录和调试。
 
@@ -83,13 +85,15 @@ sh Keil2CLion.command /path/to/工程文件夹
 
 已测试：
 
-- 用 STM32F103C8 的两个 Keil 工程测试，转换后都能用 `arm-none-eabi-gcc` 14.2 和 CLion 自带的 CMake、Ninja 编译。
+- 用 15 个真实的 STM32F103 Keil 工程测试，转换后都能用 `arm-none-eabi-gcc` 14.2 和 CLion 自带的 CMake、Ninja 编译。
+- 用 Keil 芯片包里的 CMSIS 启动文件，测试了 Cortex-M0、M0+、M1、M3、M4 和 M7 的转换和编译，包括 M4、M7 的硬件浮点。这些测试工程是临时搭的，只验证能编译。
 - 没有增删文件时，转过去再转回来，工程和原来逐字节相同。
 - 新增文件和文件夹后转回 Keil，用 ARMCC 编译 0 错误 0 警告，Keil 界面也能显示新文件。
 
 还没验证：
 
 - 没有在真实的 Mac 上运行过。Mac 脚本是在 WSL 的 Linux 上测试的，生成结果和 bat 逐字节一致。
+- 除 STM32F103 外，没有用其他系列的真实工程测试过，比如 CubeMX 生成的 F4、H7 工程。
 - GCC 版本还没有在 CLion 界面里编译过。
 - GCC 编译的程序还没有上板运行过。
 
