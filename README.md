@@ -25,16 +25,20 @@
 | `clear.cmd` | Windows | 清理编译产物 |
 | `clear.command` | Mac | 清理编译产物 |
 
-Windows 脚本基于系统自带的 PowerShell，Mac 脚本基于 Perl，都不用另外安装 Python。
+Windows 脚本需要 PowerShell 7（`pwsh`），不支持系统自带的 5.1。Mac 脚本基于 Perl。都不用安装 Python。
 
 ## 快速开始
 
 ### 1. 安装编译器
 
-Windows：
+Windows（同时安装 PowerShell 7）：
 
 ```bash
 winget install --id Arm.GnuArmEmbeddedToolchain --exact
+```
+
+```bash
+winget install --id Microsoft.PowerShell --exact
 ```
 
 Mac：
@@ -70,12 +74,15 @@ sh Keil2CLion.command /path/to/工程文件夹
 - **串口 `printf`：** 继续写 `fputc`，不要改成 `_write`。
 - **型号宏：** Keil 芯片包自动加的宏（如 `STM32F10X_MD`）会根据启动文件名推导，规则见[使用说明](使用说明.md#型号宏)。推导不出时脚本会提示，在 Keil 的 Define 框里手动加上即可。
 - **编译结果不同：** 两个编译器生成的程序不一样，时序敏感的功能要分别验证。
+- **小 RAM 芯片：** GCC 的 C 库比 Keil 的 MicroLIB 占内存。链接报 RAM 不够时，调小 Keil 启动文件里的 `Stack_Size` 或 `Heap_Size`，再运行一次 `Keil2CLion`。
+- **CMSIS 头文件：** Keil 工程常从 CMSIS 包读取 `core_cmN.h`。脚本会向上查找 `Drivers/CMSIS`，所以要保留 Cube 固件包的目录结构；找不到时会提示。
+- **FreeRTOS：** 转到 CLion 时会自动把 `portable/RVDS` 换成 `portable/GCC`，工程里要有这个目录。
 - **`cmake/` 里的文件都是生成的：** 手动修改不会同步回 Keil，转回时还会被删除。
 
 ## 限制
 
 - 只支持 Cortex-M 内核，工程里要有 ARM 语法的启动文件（`.s`）。由 Keil RTE 管理的启动文件读不到。
-- 主要面向 ARM Compiler 5 工程。AC6 工程只做了基本适配，没有测试过。
+- AC6 工程能转换并用 GCC 编译（ST 的 L5、U5、WB 例程已测），但 AC6 专有的编译选项不会转换，也不支持 GNU 语法的启动文件。
 - 不支持 C++ 源文件，也不能使用 Keil 编译好的 `.lib`、`.o`。
 - 只生成一段 Flash 和一段 RAM，Keil 里的 IRAM2、CCM 等额外内存不会写进链接脚本。
 - `CLion2Keil` 目前只有 Windows 版。
@@ -86,16 +93,18 @@ sh Keil2CLion.command /path/to/工程文件夹
 已测试：
 
 - 用 15 个真实的 STM32F103 Keil 工程测试，转换后都能用 `arm-none-eabi-gcc` 14.2 和 CLion 自带的 CMake、Ninja 编译。
-- 用 Keil 芯片包里的 CMSIS 启动文件，测试了 Cortex-M0、M0+、M1、M3、M4 和 M7 的转换和编译，包括 M4、M7 的硬件浮点。这些测试工程是临时搭的，只验证能编译。
+- 用 ST 官方的 42 个 Keil 例程测试，覆盖 F0、F1、F3、F4、F7、G0、G4、H7、L0、L1、L4、L5、U5、WB 共 14 个系列，包括 HAL、LL 和 FreeRTOS 工程。其中 41 个能直接编译，L011（2 KB RAM）因 RAM 不够要调小栈或堆。
+- 用 QEMU 实际运行了 13 个测试固件，覆盖 Cortex-M0、M3、M4、M7、M33 的软硬件浮点，以及 ST 的真实启动文件。验证了 `.data`、`.bss`、构造函数、SysTick 中断和 `printf` 输出。
 - 没有增删文件时，转过去再转回来，工程和原来逐字节相同。
 - 新增文件和文件夹后转回 Keil，用 ARMCC 编译 0 错误 0 警告，Keil 界面也能显示新文件。
 
 还没验证：
 
 - 没有在真实的 Mac 上运行过。Mac 脚本是在 WSL 的 Linux 上测试的，生成结果和 bat 逐字节一致。
-- 除 STM32F103 外，没有用其他系列的真实工程测试过，比如 CubeMX 生成的 F4、H7 工程。
+- 没有上真实开发板，外设是否工作没有验证。QEMU 只验证了启动流程和内核功能。
+- ST 例程转回 Keil 后没有用 Keil 编译，这台测试机只装了 F1 的芯片包。
+- 没有测试 CubeMX 现场生成的工程，只测试了 ST 官方例程。
 - GCC 版本还没有在 CLion 界面里编译过。
-- GCC 编译的程序还没有上板运行过。
 
 ## 详细文档
 

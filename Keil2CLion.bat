@@ -5,7 +5,13 @@ chcp 65001 >nul
 setlocal
 set "K2C_BAT=%~f0"
 set "K2C_ARG=%~1"
-powershell -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
+where pwsh >nul 2>nul
+if errorlevel 1 (
+    echo 需要 PowerShell 7，请先运行: winget install --id Microsoft.PowerShell --exact
+    if not defined K2C_NOPAUSE pause
+    exit /b 1
+)
+pwsh -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
 set "K2C_RC=%errorlevel%"
 if not defined K2C_NOPAUSE pause
 exit /b %K2C_RC%
@@ -88,6 +94,42 @@ function Get-DeviceDefine($startup, $defines) {
     if ($n -match '^(STM32F10X|STM32L1XX|GD32F\d0X)_') { return $n }
     if ($n -match '^STM32') { return ($n -creplace 'X', 'x') }
     return ''
+}
+
+# Memory from the Cpu string, written as IROM(start-end) or IROM(start,size)
+function Get-CpuRange($cpuStr, $name) {
+    if ($cpuStr -notmatch "$name\((0x[0-9A-Fa-f]+)([-,])(0x[0-9A-Fa-f]+)\)") { return @('', '') }
+    $start = $Matches[1]; $sep = $Matches[2]; $last = $Matches[3]
+    if ($sep -eq ',') { return @($start, $last) }
+    return @($start, ('0x{0:X}' -f ([Convert]::ToInt64($last, 16) - [Convert]::ToInt64($start, 16) + 1)))
+}
+
+# Projects using Keil's CMSIS::CORE pack component do not list the folder holding core_cmN.h.
+# The Cube packages carry the same headers under Drivers/CMSIS, so look for them above the project.
+function Find-CmsisInclude($dir, $incFolders) {
+    foreach ($i in $incFolders) {
+        if (Get-ChildItem -LiteralPath (Join-Path $dir $i) -Filter 'core_cm*.h' -ErrorAction SilentlyContinue) { return '' }
+    }
+    $up = ''
+    $base = $dir
+    for ($n = 0; $n -le 8; $n++) {
+        foreach ($sub in 'Drivers/CMSIS/Core/Include', 'Drivers/CMSIS/Include', 'CMSIS/Core/Include', 'CMSIS/Include') {
+            if (Get-ChildItem -LiteralPath (Join-Path $base $sub) -Filter 'core_cm*.h' -ErrorAction SilentlyContinue) { return "$up$sub" }
+        }
+        $parent = Split-Path $base -Parent
+        if (-not $parent) { break }
+        $base = $parent
+        $up += '../'
+    }
+    return ''
+}
+
+# FreeRTOS's portable/RVDS port is ARMCC-only; the same port for GCC sits next to it
+function Get-GccPort($dir, $rel) {
+    if ($rel -notmatch '/portable/RVDS/') { return $rel }
+    $gcc = $rel -replace '/portable/RVDS/', '/portable/GCC/'
+    if (Test-Path -LiteralPath (Join-Path $dir $gcc)) { return $gcc }
+    return $rel
 }
 
 # Keil startup file -> GNU assembler startup file, keeping its vector table and stack/heap sizes
@@ -222,9 +264,10 @@ function Convert-Project($dir) {
     $archFlags = "-mcpu=$cpu -mthumb"
     $ads = 'TargetOption/TargetArmAds'
 
-    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision
+    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision.
+    # Projects copied between devices can keep this setting on a core without an FPU, so the Cpu string decides too.
     $fpuSetting = Get-Opt $t "$ads/ArmAdsMisc/RvdsVP"
-    if ($fpuSetting -in '2', '3') {
+    if ($fpuSetting -in '2', '3' -and $cpuStr -match 'FPU\d') {
         $fpu = 'auto'
         if ($cpu -eq 'cortex-m4') { $fpu = 'fpv4-sp-d16' }
         if ($cpu -eq 'cortex-m7') { $fpu = if ($fpuSetting -eq '3') { 'fpv5-d16' } else { 'fpv5-sp-d16' } }
@@ -235,6 +278,8 @@ function Convert-Project($dir) {
     $mem = "$ads/ArmAdsMisc/OnChipMemories"
     $romBase = Get-Opt $t "$mem/OCR_RVCT4/StartAddress"; $romSize = Get-Opt $t "$mem/OCR_RVCT4/Size"
     $ramBase = Get-Opt $t "$mem/OCR_RVCT9/StartAddress"; $ramSize = Get-Opt $t "$mem/OCR_RVCT9/Size"
+    if ($romSize -in '', '0x0') { $romBase, $romSize = Get-CpuRange $cpuStr 'IROM' }
+    if ($ramSize -in '', '0x0') { $ramBase, $ramSize = Get-CpuRange $cpuStr 'IRAM' }
     if ($romSize -in '', '0x0' -or $ramSize -in '', '0x0') { throw '读不出 Flash 或 RAM 的地址，请检查 Options for Target 的 Target 页。' }
     if ((Get-Opt $t "$ads/LDads/umfTarg") -eq '0' -and (Get-Opt $t "$ads/LDads/ScatterFile")) {
         Write-Host '  注意: 工程用了自定义 .sct，GCC 用不了，已按 Target 页的内存布局生成链接脚本'
@@ -243,13 +288,14 @@ function Convert-Project($dir) {
     # C options
     $cOpt = @('-g', '-ffunction-sections', '-fdata-sections')
     switch (Get-Opt $t "$ads/Cads/Optim") { '1' { $cOpt += '-O0' } '2' { $cOpt += '-O1' } '3' { $cOpt += '-O2' } '4' { $cOpt += '-O3' } default { $cOpt += '-O2' } }
+    $cMisc = Get-Opt $t "$ads/Cads/VariousControls/MiscControls"
     if ((Get-Opt $t 'uAC6') -eq '1') { $cOpt += '-std=gnu11' }
-    elseif ((Get-Opt $t "$ads/Cads/uC99") -eq '1') { $cOpt += '-std=gnu99' }
+    elseif ((Get-Opt $t "$ads/Cads/uC99") -eq '1' -or $cMisc -match '--c99') { $cOpt += '-std=gnu99' }
     else { $cOpt += '-std=gnu90' }
     if ((Get-Opt $t "$ads/Cads/EnumInt") -eq '0') { $cOpt += '-fshort-enums' }
     if ((Get-Opt $t "$ads/Cads/PlainCh") -eq '1') { $cOpt += '-fsigned-char' } else { $cOpt += '-funsigned-char' }
     switch (Get-Opt $t "$ads/Cads/wLevel") { '1' { $cOpt += '-w' } '2' { $cOpt += '-Wall' } }
-    if (Get-Opt $t "$ads/Cads/VariousControls/MiscControls") { Write-Host '  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略' }
+    if (($cMisc -replace '(?i)--c99', '').Trim()) { Write-Host '  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略' }
 
     # Defines: Keil adds the device macro itself, it is not in the project's Define box
     $startupPath = Join-Path $dir $asmSrc[0]
@@ -262,7 +308,15 @@ function Convert-Project($dir) {
     } elseif (-not @($defs | Where-Object { $_ -match '^(STM32|GD32|ARMCM|ARMSC)' }).Count) {
         Write-Host "  注意: 没能从 $(Split-Path $startupPath -Leaf) 判断型号宏。如果编译时报缺少器件宏，请在 Keil 的 Define 框里加上，比如 STM32F407xx"
     }
-    $incs = @(Split-Semi (Get-Opt $t "$ads/Cads/VariousControls/IncludePath") | ForEach-Object { '${CMAKE_CURRENT_SOURCE_DIR}/' + (Get-RelPath $_) })
+    $incFolders = @(Split-Semi (Get-Opt $t "$ads/Cads/VariousControls/IncludePath") | ForEach-Object { Get-GccPort $dir (Get-RelPath $_) })
+    $incs = @($incFolders | ForEach-Object { '${CMAKE_CURRENT_SOURCE_DIR}/' + $_ })
+    $cmsisInclude = Find-CmsisInclude $dir $incFolders
+    if ($cmsisInclude) {
+        $deviceBlock = "# Keil takes these headers from its CMSIS pack, so they are not in the project's include paths`nset(KEIL_CMSIS_INCLUDE `"`${CMAKE_CURRENT_SOURCE_DIR}/$cmsisInclude`")`n`n" + $deviceBlock
+        $incs += '${KEIL_CMSIS_INCLUDE}'
+    } elseif ($t.OuterXml -match 'Cclass="CMSIS"' -and -not @($incFolders | Where-Object { Get-ChildItem -LiteralPath (Join-Path $dir $_) -Filter 'core_cm*.h' -ErrorAction SilentlyContinue }).Count) {
+        Write-Host '  注意: 工程用的是 Keil 的 CMSIS 包，没找到 core_cmN.h。请把这些头文件放进工程，并在 Keil 里加上头文件路径'
+    }
 
     $name = Get-Opt $t 'TargetOption/TargetCommonOption/OutputName'
     if (-not $name) { $name = [IO.Path]::GetFileNameWithoutExtension($uv[0].Name) }
@@ -273,7 +327,9 @@ function Convert-Project($dir) {
         [IO.File]::ReadAllText((Join-Path $dir $_), $Latin1)
     }) -join "`n"
     $code = [regex]::Replace($code, '/\*[\s\S]*?\*/|//[^\n]*', '')
-    $hasFputc = $code -match '\bint\s+fputc\s*\('
+    # ST's examples define __io_putchar for GCC and keep fputc only inside a #define for other compilers
+    $hasIoPutchar = $code -match '\b__io_putchar\b'
+    $hasFputc = $code -match '(?m)^(?!\s*#).*\bint\s+fputc\s*\('
     $linkOpt = @('-Wl,--gc-sections', ('-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/' + $name + '.map'), '-T${CMAKE_CURRENT_SOURCE_DIR}/cmake/Project.ld')
     if ($code -match '%[-+ #0]*\d*(\.\d+)?l?[fFeEgG]') {
         $linkOpt += '-u _printf_float'
@@ -301,23 +357,26 @@ function Convert-Project($dir) {
             [IO.File]::WriteAllText((Join-Path $cmakeDir $coreName), "/* $Marker from $c */`n" + $coreText, $Latin1)
             $srcList += "cmake/$coreName"
         } else {
-            $srcList += $c
+            $srcList += (Get-GccPort $dir $c)
         }
     }
 
     # printf: Keil's MicroLIB calls fputc, GCC's newlib calls _write and buffers stdout
     $compatFile = Join-Path $cmakeDir 'keil_compat.c'
-    if ($hasFputc) {
+    if ($hasFputc -or $hasIoPutchar) {
+        # Weak because board support code can mention __io_putchar in a part that is compiled out
+        $putcharDecl = if ($hasIoPutchar) { "int __io_putchar(int ch) __attribute__((weak));`n`n" } else { '' }
+        $putcharCall = if ($hasIoPutchar) { 'if (__io_putchar) __io_putchar((unsigned char)buf[i])' } else { 'fputc((unsigned char)buf[i], stdout)' }
         $compat = @'
-/* {MARKER}. Routes printf to the project's own fputc, as Keil's MicroLIB does. */
+/* {MARKER}. Routes printf to the project's own output function, as Keil's MicroLIB does. */
 #include <stdio.h>
 
-int _write(int fd, char *buf, int len)
+{DECL}int _write(int fd, char *buf, int len)
 {
     int i;
     (void)fd;
     for (i = 0; i < len; i++) {
-        fputc((unsigned char)buf[i], stdout);
+        {CALL};
     }
     return len;
 }
@@ -327,7 +386,7 @@ __attribute__((constructor)) static void keil_compat_stdio_init(void)
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 '@
-        Save-Text $compatFile $compat.Replace('{MARKER}', $Marker)
+        Save-Text $compatFile $compat.Replace('{MARKER}', $Marker).Replace('{DECL}', $putcharDecl).Replace('{CALL}', $putcharCall)
         $srcList += 'cmake/keil_compat.c'
     } else {
         Remove-Stale $compatFile

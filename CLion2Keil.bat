@@ -5,7 +5,13 @@ chcp 65001 >nul
 setlocal
 set "K2C_BAT=%~f0"
 set "K2C_ARG=%~1"
-powershell -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
+where pwsh >nul 2>nul
+if errorlevel 1 (
+    echo 需要 PowerShell 7，请先运行: winget install --id Microsoft.PowerShell --exact
+    if not defined K2C_NOPAUSE pause
+    exit /b 1
+)
+pwsh -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
 set "K2C_RC=%errorlevel%"
 if not defined K2C_NOPAUSE pause
 exit /b %K2C_RC%
@@ -128,7 +134,12 @@ function Sync-Project($dir, $cmakeText) {
     }
 
     # What CMake lists now; files under cmake/ are generated stand-ins for Keil's startup and core_cm3 files
-    $cmakeSources = @(Get-CMakeArgs $cmakeText 'add_executable' | ForEach-Object { Get-CMakePath $_ })
+    $cmakeSources = @(Get-CMakeArgs $cmakeText 'add_executable' | ForEach-Object {
+        # Keil2CLion swaps FreeRTOS's ARMCC port for its GCC port; Keil keeps the ARMCC one
+        $s = Get-CMakePath $_
+        $rvds = $s -replace '/portable/GCC/', '/portable/RVDS/'
+        if ($keilFiles.ContainsKey((Get-Key $rvds))) { $rvds } else { $s }
+    })
     if (-not $cmakeSources) { throw 'CMakeLists.txt 里找不到 add_executable。' }
     $cmakeKeys = @{}
     $usesCore = $false
@@ -190,7 +201,13 @@ function Sync-Project($dir, $cmakeText) {
     $definesChanged = (@($newDefines) -join ',') -ne (@($keilDefines) -join ',')
 
     $keilIncs = @(((Get-Tag $cads 'IncludePath') -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $cmakeIncs = @(Get-CMakeArgs $cmakeText 'target_include_directories' | ForEach-Object { Get-CMakePath $_ })
+    # KEIL_CMSIS_INCLUDE stands in for Keil's CMSIS pack, so it never goes in the include paths
+    $keilIncKeysRaw = @($keilIncs | ForEach-Object { Get-Key $_ })
+    $cmakeIncs = @(Get-CMakeArgs $cmakeText 'target_include_directories' | Where-Object { $_ -ne '${KEIL_CMSIS_INCLUDE}' } | ForEach-Object {
+        $s = Get-CMakePath $_
+        $rvds = $s -replace '/portable/GCC/', '/portable/RVDS/'
+        if ($keilIncKeysRaw -contains (Get-Key $rvds)) { $rvds } else { $s }
+    })
     foreach ($s in $toAdd) {
         $folder = (Split-Path $s -Parent) -replace '\\', '/'
         if (-not $folder) { $folder = '.' }

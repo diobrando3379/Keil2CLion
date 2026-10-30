@@ -164,6 +164,47 @@ sub device_define {
     return '';
 }
 
+# Memory from the Cpu string, written as IROM(start-end) or IROM(start,size)
+sub cpu_range {
+    my ($cpu_str, $name) = @_;
+    return ('', '') unless $cpu_str =~ /$name\((0x[0-9A-Fa-f]+)([-,])(0x[0-9A-Fa-f]+)\)/i;
+    my ($start, $sep, $last) = ($1, $2, $3);
+    return ($start, $last) if $sep eq ',';
+    return ($start, sprintf('0x%X', hex($last) - hex($start) + 1));
+}
+
+sub has_core_header {
+    my ($folder) = @_;
+    return scalar(() = glob("\Q$folder\E/core_cm*.h"));
+}
+
+# Projects using Keil's CMSIS::CORE pack component do not list the folder holding core_cmN.h.
+# The Cube packages carry the same headers under Drivers/CMSIS, so look for them above the project.
+sub find_cmsis_include {
+    my ($dir, @inc_folders) = @_;
+    for my $i (@inc_folders) { return '' if has_core_header("$dir/$i"); }
+    my $up = '';
+    my $base = $dir;
+    for my $n (0 .. 8) {
+        for my $sub ('Drivers/CMSIS/Core/Include', 'Drivers/CMSIS/Include', 'CMSIS/Core/Include', 'CMSIS/Include') {
+            return "$up$sub" if has_core_header("$base/$sub");
+        }
+        my $parent = dirname($base);
+        last if $parent eq $base;
+        $base = $parent;
+        $up .= '../';
+    }
+    return '';
+}
+
+# FreeRTOS's portable/RVDS port is ARMCC-only; the same port for GCC sits next to it
+sub gcc_port {
+    my ($dir, $rel) = @_;
+    return $rel unless $rel =~ m{/portable/RVDS/}i;
+    (my $gcc = $rel) =~ s{/portable/RVDS/}{/portable/GCC/}i;
+    return -e "$dir/$gcc" ? $gcc : $rel;
+}
+
 # Keil startup file -> GNU assembler startup file, keeping its vector table and stack/heap sizes
 sub convert_startup {
     my ($path) = @_;
@@ -299,9 +340,10 @@ sub convert_project {
     my $arch = "-mcpu=$cpu -mthumb";
     my $ads = 'TargetOption/TargetArmAds';
 
-    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision
+    # Floating Point Hardware on the Target page: 2 is single precision, 3 is double precision.
+    # Projects copied between devices can keep this setting on a core without an FPU, so the Cpu string decides too.
     my $fpu_setting = opt($t, "$ads/ArmAdsMisc/RvdsVP");
-    if ($fpu_setting eq '2' || $fpu_setting eq '3') {
+    if (($fpu_setting eq '2' || $fpu_setting eq '3') && $cpu_str =~ /FPU\d/i) {
         my $fpu = 'auto';
         $fpu = 'fpv4-sp-d16' if $cpu eq 'cortex-m4';
         $fpu = $fpu_setting eq '3' ? 'fpv5-d16' : 'fpv5-sp-d16' if $cpu eq 'cortex-m7';
@@ -312,6 +354,8 @@ sub convert_project {
     my $mem = "$ads/ArmAdsMisc/OnChipMemories";
     my $rom_base = opt($t, "$mem/OCR_RVCT4/StartAddress"); my $rom_size = opt($t, "$mem/OCR_RVCT4/Size");
     my $ram_base = opt($t, "$mem/OCR_RVCT9/StartAddress"); my $ram_size = opt($t, "$mem/OCR_RVCT9/Size");
+    ($rom_base, $rom_size) = cpu_range($cpu_str, 'IROM') if $rom_size eq '' || lc($rom_size) eq '0x0';
+    ($ram_base, $ram_size) = cpu_range($cpu_str, 'IRAM') if $ram_size eq '' || lc($ram_size) eq '0x0';
     die "读不出 Flash 或 RAM 的地址，请检查 Options for Target 的 Target 页。\n" if grep { $_ eq '' || lc($_) eq '0x0' } $rom_size, $ram_size;
     if (opt($t, "$ads/LDads/umfTarg") eq '0' && opt($t, "$ads/LDads/ScatterFile") ne '') {
         print "  注意: 工程用了自定义 .sct，GCC 用不了，已按 Target 页的内存布局生成链接脚本\n";
@@ -321,13 +365,14 @@ sub convert_project {
     my @c_opt = ('-g', '-ffunction-sections', '-fdata-sections');
     my %levels = (1 => '-O0', 2 => '-O1', 3 => '-O2', 4 => '-O3');
     push @c_opt, $levels{opt($t, "$ads/Cads/Optim")} // '-O2';
-    push @c_opt, opt($t, 'uAC6') eq '1' ? '-std=gnu11' : opt($t, "$ads/Cads/uC99") eq '1' ? '-std=gnu99' : '-std=gnu90';
+    my $c_misc = opt($t, "$ads/Cads/VariousControls/MiscControls");
+    push @c_opt, opt($t, 'uAC6') eq '1' ? '-std=gnu11' : (opt($t, "$ads/Cads/uC99") eq '1' || $c_misc =~ /--c99/i) ? '-std=gnu99' : '-std=gnu90';
     push @c_opt, '-fshort-enums' if opt($t, "$ads/Cads/EnumInt") eq '0';
     push @c_opt, opt($t, "$ads/Cads/PlainCh") eq '1' ? '-fsigned-char' : '-funsigned-char';
     my $w_level = opt($t, "$ads/Cads/wLevel");
     push @c_opt, '-w' if $w_level eq '1';
     push @c_opt, '-Wall' if $w_level eq '2';
-    print "  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略\n" if opt($t, "$ads/Cads/VariousControls/MiscControls") ne '';
+    print "  注意: C/C++ 页的 Misc Controls 是 ARMCC 选项，已忽略\n" if ($c_misc =~ s/--c99//gir) =~ /\S/;
 
     # Defines: Keil adds the device macro itself, it is not in the project's Define box
     my $startup_path = "$dir/$asm_src[0]";
@@ -342,7 +387,15 @@ sub convert_project {
     }
     my @shown_defs = (@defs, $device_define ne '' ? ($device_define) : ());
     push @defs, '${KEIL_DEVICE_DEFINE}' if $device_define ne '';
-    my @incs = map { '${CMAKE_CURRENT_SOURCE_DIR}/' . rel_path($_) } split_semi(opt($t, "$ads/Cads/VariousControls/IncludePath"));
+    my @inc_folders = map { gcc_port($dir, rel_path($_)) } split_semi(opt($t, "$ads/Cads/VariousControls/IncludePath"));
+    my @incs = map { '${CMAKE_CURRENT_SOURCE_DIR}/' . $_ } @inc_folders;
+    my $cmsis_include = find_cmsis_include($dir, @inc_folders);
+    if ($cmsis_include ne '') {
+        $device_block = "# Keil takes these headers from its CMSIS pack, so they are not in the project's include paths\nset(KEIL_CMSIS_INCLUDE \"\${CMAKE_CURRENT_SOURCE_DIR}/$cmsis_include\")\n\n" . $device_block;
+        push @incs, '${KEIL_CMSIS_INCLUDE}';
+    } elsif ($t =~ /Cclass="CMSIS"/ && !grep { has_core_header("$dir/$_") } @inc_folders) {
+        print "  注意: 工程用的是 Keil 的 CMSIS 包，没找到 core_cmN.h。请把这些头文件放进工程，并在 Keil 里加上头文件路径\n";
+    }
 
     my $name = opt($t, 'TargetOption/TargetCommonOption/OutputName');
     $name = $uv[0] =~ s/\.[^.]*$//r if $name eq '';
@@ -351,7 +404,9 @@ sub convert_project {
     # What the application needs from the C library, which Keil's MicroLIB gave it implicitly
     my $code = join("\n", map { read_file("$dir/$_") } grep { !m{^(Library|Start)/}i } @c_src);
     $code =~ s{/\*.*?\*/|//[^\n]*}{}sg;
-    my $has_fputc = $code =~ /\bint\s+fputc\s*\(/i;
+    # ST's examples define __io_putchar for GCC and keep fputc only inside a #define for other compilers
+    my $has_io_putchar = $code =~ /\b__io_putchar\b/i;
+    my $has_fputc = $code =~ /^(?!\s*#).*\bint\s+fputc\s*\(/mi;
     my @link_opt = ('-Wl,--gc-sections', '-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/' . $name . '.map', '-T${CMAKE_CURRENT_SOURCE_DIR}/cmake/Project.ld');
     if ($code =~ /%[-+ #0]*\d*(\.\d+)?l?[fFeEgG]/) {
         push @link_opt, '-u _printf_float';
@@ -379,23 +434,26 @@ sub convert_project {
             write_file("$cmake_dir/$core_name", "/* $Marker from $c */\n" . $core);
             push @src_list, "cmake/$core_name";
         } else {
-            push @src_list, $c;
+            push @src_list, gcc_port($dir, $c);
         }
     }
 
     # printf: Keil's MicroLIB calls fputc, GCC's newlib calls _write and buffers stdout
     my $compat_file = "$cmake_dir/keil_compat.c";
-    if ($has_fputc) {
+    if ($has_fputc || $has_io_putchar) {
+        # Weak because board support code can mention __io_putchar in a part that is compiled out
+        my $putchar_decl = $has_io_putchar ? "int __io_putchar(int ch) __attribute__((weak));\n\n" : '';
+        my $putchar_call = $has_io_putchar ? 'if (__io_putchar) __io_putchar((unsigned char)buf[i])' : 'fputc((unsigned char)buf[i], stdout)';
         my $compat = <<'END';
-/* {MARKER}. Routes printf to the project's own fputc, as Keil's MicroLIB does. */
+/* {MARKER}. Routes printf to the project's own output function, as Keil's MicroLIB does. */
 #include <stdio.h>
 
-int _write(int fd, char *buf, int len)
+{DECL}int _write(int fd, char *buf, int len)
 {
     int i;
     (void)fd;
     for (i = 0; i < len; i++) {
-        fputc((unsigned char)buf[i], stdout);
+        {CALL};
     }
     return len;
 }
@@ -405,7 +463,7 @@ __attribute__((constructor)) static void keil_compat_stdio_init(void)
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 END
-        write_file($compat_file, fill($compat, MARKER => $Marker));
+        write_file($compat_file, fill($compat, MARKER => $Marker, DECL => $putchar_decl, CALL => $putchar_call));
         push @src_list, 'cmake/keil_compat.c';
     } else {
         remove_stale($compat_file);
