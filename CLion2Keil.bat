@@ -5,13 +5,7 @@ chcp 65001 >nul
 setlocal
 set "K2C_BAT=%~f0"
 set "K2C_ARG=%~1"
-where pwsh >nul 2>nul
-if errorlevel 1 (
-    echo 需要 PowerShell 7，请先运行: winget install --id Microsoft.PowerShell --exact
-    if not defined K2C_NOPAUSE pause
-    exit /b 1
-)
-pwsh -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
+powershell -NoProfile -Command "$s=[IO.File]::ReadAllText($env:K2C_BAT,[Text.Encoding]::UTF8); Invoke-Expression $s.Substring($s.IndexOf('#'+'__PS__'))"
 set "K2C_RC=%errorlevel%"
 if not defined K2C_NOPAUSE pause
 exit /b %K2C_RC%

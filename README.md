@@ -25,20 +25,16 @@
 | `clear.cmd` | Windows | 清理编译产物 |
 | `clear.command` | Mac | 清理编译产物 |
 
-Windows 脚本需要 PowerShell 7（`pwsh`），不支持系统自带的 5.1。Mac 脚本基于 Perl。都不用安装 Python。
+Windows 脚本用系统自带的 PowerShell，Mac 脚本用 Perl，都不用另外安装 Python。
 
 ## 快速开始
 
 ### 1. 安装编译器
 
-Windows（同时安装 PowerShell 7）：
+Windows：
 
 ```bash
 winget install --id Arm.GnuArmEmbeddedToolchain --exact
-```
-
-```bash
-winget install --id Microsoft.PowerShell --exact
 ```
 
 Mac：
@@ -104,7 +100,7 @@ sh Keil2CLion.command /path/to/工程文件夹
 - 没有上真实开发板，外设是否工作没有验证。QEMU 只验证了启动流程和内核功能。
 - ST 例程转回 Keil 后没有用 Keil 编译，这台测试机只装了 F1 的芯片包。
 - 没有测试 CubeMX 现场生成的工程，只测试了 ST 官方例程。
-- GCC 版本还没有在 CLion 界面里编译过。
+- CLion 界面只在 Windows 上用 `01_LED` 实测过，编译、语法分析和跳转都正常。
 
 ## 详细文档
 
