@@ -73,7 +73,7 @@ sh Keil2CLion.command /path/to/工程文件夹
 
 输出的 `.elf`、`.hex` 和 `.map` 在 `cmake-build-debug` 里。
 
-不要选 `Project` 配置再点运行，它会在电脑上直接运行 ARM 程序，报 `CreateProcess error=193`。
+第一次打开工程时，CLion 可能默认选中 `Project`，要手动换成 `OpenOCD`。不要选 `Project` 配置再点运行，它会在电脑上直接运行 ARM 程序：Windows 上报 `CreateProcess error=193`；Mac 上只显示退出代码 127，看起来像烧录没反应。
 
 烧录日志全是红字是正常的，因为 OpenOCD 把日志都输出到 stderr。看到 `** Programming Finished **`，并且前面没有 `Error:`，就是成功了。
 
@@ -115,10 +115,11 @@ sh Keil2CLion.command /path/to/工程文件夹
 - 没有增删文件时，转过去再转回来，工程和原来逐字节相同。
 - 新增文件和文件夹后转回 Keil，用 ARMCC 编译 0 错误 0 警告，Keil 界面也能显示新文件。
 - 在 Windows 的 CLion 界面里，用 STM32F103C8 真板和 ST-Link V2 实测了 `11_PWM`：能编译和烧录，读回 Flash 和 hex 一致，断点、调用栈和单步都正常，运行时 TIM3 的寄存器也符合代码。
+- 在 Apple Silicon 的 Mac 上（macOS 27.2、CLion 2026.2、Arm GNU Toolchain 15.3.rel2、OpenOCD 0.12.0）转换并编译了 13 个真实的 STM32F103 Keil 工程。还用 STM32F103C8 真板和 ST-Link V2 在 CLion 界面里实测了 `11_PWM`：能烧录，烧录后程序运行，读回 Flash 和 ELF 一致，断点和单步正常。
 
 还没验证：
 
-- 没有在真实的 Mac 上运行过。Mac 脚本是在 WSL 的 Linux 上测试的，生成结果和 bat 逐字节一致。
+- Mac 上的 CLion 界面只测过 `11_PWM`，没有在 Intel Mac 上测过，也没有测过在访达里双击运行脚本。
 - 烧录和调试只在 STM32F103 上实测过。其他 13 个系列只验证了生成的 OpenOCD 配置能加载，没有连真板。
 - 真板上只读了寄存器，没有验证外设的实物效果。
 - ST 例程转回 Keil 后没有用 Keil 编译，这台测试机只装了 F1 的芯片包。
