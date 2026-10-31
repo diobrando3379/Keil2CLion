@@ -669,10 +669,52 @@ add_custom_command(TARGET {TARGET} POST_BUILD
     COMMAND "${ARM_SIZE}" "$<TARGET_FILE_NAME:{TARGET}>"
     COMMENT "Creating {NAME}.hex"
 )
+
+# Build this target to flash the board, using whichever programmer is installed
+find_program(ST_LINK_CLI ST-LINK_CLI PATHS
+    "C:/Program Files (x86)/STMicroelectronics/STM32 ST-LINK Utility/ST-LINK Utility"
+    "C:/Program Files/STMicroelectronics/STM32 ST-LINK Utility/ST-LINK Utility"
+)
+find_program(ST_FLASH st-flash PATHS /opt/homebrew/bin /usr/local/bin)
+find_program(OPENOCD openocd PATHS /opt/homebrew/bin /usr/local/bin)
+if(ST_LINK_CLI)
+    set(FLASH_COMMAND "${ST_LINK_CLI}" -c SWD -P "{NAME}.hex" -V after_programming -Rst)
+elseif(ST_FLASH)
+    set(FLASH_COMMAND "${ST_FLASH}" --reset --format ihex write "{NAME}.hex")
+{OCD}else()
+    set(FLASH_COMMAND "${CMAKE_COMMAND}" -E echo "No programmer found: install ST-LINK Utility, stlink or OpenOCD" COMMAND "${CMAKE_COMMAND}" -E false)
+endif()
+add_custom_target(flash COMMAND ${FLASH_COMMAND} DEPENDS {TARGET} WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" USES_TERMINAL VERBATIM)
 END
+    # OpenOCD names its chip configurations by family, unlike the other two programmers
+    my $ocd_block = '';
+    my $ocd_cfg = '';
+    if (opt($t, 'TargetOption/TargetCommonOption/Device') =~ /^STM32(F[0-47]|G[04]|H7|L[0145]|U5|WB|WL)/i) {
+        my $family = lc($1);
+        $ocd_cfg = ($family eq 'l0' || $family eq 'l1') ? "stm32$family" : "stm32${family}x";
+        $ocd_block = "elseif(OPENOCD)\n    set(FLASH_COMMAND \"\${OPENOCD}\" -f interface/stlink.cfg -f target/$ocd_cfg.cfg -c \"program {NAME}.hex verify reset exit\")\n";
+    }
+    $cmake =~ s/\{OCD\}/$ocd_block/;
     write_file($out_file, fill($cmake,
         MARKER => $Marker, UVPROJX => $uv[0], TARGET => $target, NAME => $name, DEVICE => $device_block,
         SRC => $fmt->(@src_list), INCS => $fmt_c->(@incs), DEFS => $fmt_c->(@defs), COPT => $fmt_c->(@c_opt), LOPT => $fmt->(@link_opt)));
+
+    # CLion's OpenOCD run configuration: Run flashes the board, Debug also stops at breakpoints
+    if ($ocd_cfg ne '') {
+        write_file("$cmake_dir/stlink.cfg", "# $Marker. Do not edit by hand.\nsource [find interface/stlink.cfg]\nsource [find target/$ocd_cfg.cfg]\nreset_config none\n");
+        make_path("$dir/.run");
+        my $run_config = <<'END';
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="OpenOCD" type="com.jetbrains.cidr.embedded.openocd.conf.type" factoryName="com.jetbrains.cidr.embedded.openocd.conf.factory" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="{TARGET}" TARGET_NAME="{TARGET}" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="{TARGET}" RUN_TARGET_NAME="{TARGET}">
+    <openocd board-config="$PROJECT_DIR$/cmake/stlink.cfg" gdb-port="3333" telnet-port="4444" reset-type="INIT" download-type="ALWAYS" />
+    <method v="2">
+      <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+    </method>
+  </configuration>
+</component>
+END
+        write_file("$dir/.run/OpenOCD.run.xml", fill($run_config, TARGET => $target));
+    }
 
     print "  完成: " . scalar(@c_src) . " 个 C 文件, CPU $cpu, 宏 @shown_defs\n";
 }

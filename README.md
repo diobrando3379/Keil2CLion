@@ -2,7 +2,7 @@
 
 一键把 Keil5 的 STM32 工程转成 CLion + `arm-none-eabi-gcc` 工程，调好后还能一键转回 Keil。
 
-转换时不改源码，也不用手动写 `CMakeLists.txt`、链接脚本和 GCC 启动文件。生成的 CLion 工程在 Windows 和 Mac 上都能编译。
+转换时不改源码，也不用手动写 `CMakeLists.txt`、链接脚本和 GCC 启动文件。转换后在 CLion 里能直接编译、烧录和打断点调试，生成的工程在 Windows 和 Mac 上用的是同一份。
 
 ## 功能
 
@@ -12,6 +12,7 @@
   - 根据 Keil 的内存设置生成链接脚本。
   - 修复 `core_cm3.c` 在 GCC 下的 STREX 汇编问题。
   - 把 `printf` 接到工程里的 `fputc`。
+- **烧录和调试：** 自动生成 `cmake/stlink.cfg` 和 CLion 的 OpenOCD 运行配置，不用手动添加。
 - **CLion → Keil：** 把新增或移除的文件、宏定义和头文件路径写回 Keil 工程，再删除 CLion 文件。
 - **改动很小：** 没有差异时不写入 Keil 工程文件；有差异时只改相关内容，并先备份。
 
@@ -29,9 +30,11 @@ Windows 脚本用系统自带的 PowerShell，Mac 脚本用 Perl，都不用另�
 
 ## 快速开始
 
-### 1. 安装编译器
+### 1. 安装工具
 
-Windows：
+需要编译器，以及用来烧录和调试的 [OpenOCD](https://github.com/xpack-dev-tools/openocd-xpack/releases)。
+
+Windows 安装编译器，OpenOCD 下载 `win32-x64.zip` 后解压到任意位置：
 
 ```bash
 winget install --id Arm.GnuArmEmbeddedToolchain --exact
@@ -43,6 +46,12 @@ Mac：
 brew install --cask gcc-arm-embedded
 ```
 
+```bash
+brew install open-ocd
+```
+
+然后在 CLion 里设置一次 OpenOCD 路径：**设置 → 构建、执行、部署 → 嵌入式开发 → OpenOCD Location**，选 `openocd` 可执行文件。这是 CLion 的全局设置，每台电脑只需设一次。
+
 ### 2. 转成 CLion 工程
 
 - **Windows：** 把工程文件夹拖到 `Keil2CLion.bat` 上。
@@ -52,9 +61,21 @@ brew install --cask gcc-arm-embedded
 sh Keil2CLion.command /path/to/工程文件夹
 ```
 
-### 3. 编译
+### 3. 编译、烧录和调试
 
-用 CLion 打开工程文件夹，直接 Build。输出的 `.elf`、`.hex` 和 `.map` 在 `cmake-build-debug` 里。
+用 CLion 打开工程文件夹，右上角的运行配置选 **`OpenOCD`**：
+
+| 操作 | 按钮 |
+|---|---|
+| 只编译 | 锤子 |
+| 编译并烧录 | 绿色运行按钮 |
+| 烧录并打断点调试 | 调试按钮 |
+
+输出的 `.elf`、`.hex` 和 `.map` 在 `cmake-build-debug` 里。
+
+不要选 `Project` 配置再点运行，它会在电脑上直接运行 ARM 程序，报 `CreateProcess error=193`。
+
+烧录日志全是红字是正常的，因为 OpenOCD 把日志都输出到 stderr。看到 `** Programming Finished **`，并且前面没有 `Error:`，就是成功了。
 
 ### 4. 转回 Keil
 
@@ -82,7 +103,7 @@ sh Keil2CLion.command /path/to/工程文件夹
 - 不支持 C++ 源文件，也不能使用 Keil 编译好的 `.lib`、`.o`。
 - 只生成一段 Flash 和一段 RAM，Keil 里的 IRAM2、CCM 等额外内存不会写进链接脚本。
 - `CLion2Keil` 目前只有 Windows 版。
-- 没有配置 CLion 里的烧录和调试。
+- 烧录和调试的配置默认使用 ST-Link，只为 STM32 生成。
 
 ## 测试情况
 
@@ -93,14 +114,15 @@ sh Keil2CLion.command /path/to/工程文件夹
 - 用 QEMU 实际运行了 13 个测试固件，覆盖 Cortex-M0、M3、M4、M7、M33 的软硬件浮点，以及 ST 的真实启动文件。验证了 `.data`、`.bss`、构造函数、SysTick 中断和 `printf` 输出。
 - 没有增删文件时，转过去再转回来，工程和原来逐字节相同。
 - 新增文件和文件夹后转回 Keil，用 ARMCC 编译 0 错误 0 警告，Keil 界面也能显示新文件。
+- 在 Windows 的 CLion 界面里，用 STM32F103C8 真板和 ST-Link V2 实测了 `11_PWM`：能编译和烧录，读回 Flash 和 hex 一致，断点、调用栈和单步都正常，运行时 TIM3 的寄存器也符合代码。
 
 还没验证：
 
 - 没有在真实的 Mac 上运行过。Mac 脚本是在 WSL 的 Linux 上测试的，生成结果和 bat 逐字节一致。
-- 没有上真实开发板，外设是否工作没有验证。QEMU 只验证了启动流程和内核功能。
+- 烧录和调试只在 STM32F103 上实测过，其他系列的 OpenOCD 配置没有测试。
+- 真板上只读了寄存器，没有验证外设的实物效果。
 - ST 例程转回 Keil 后没有用 Keil 编译，这台测试机只装了 F1 的芯片包。
 - 没有测试 CubeMX 现场生成的工程，只测试了 ST 官方例程。
-- CLion 界面只在 Windows 上用 `01_LED` 实测过，编译、语法分析和跳转都正常。
 
 ## 详细文档
 

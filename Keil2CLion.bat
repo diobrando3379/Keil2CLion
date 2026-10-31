@@ -586,10 +586,53 @@ add_custom_command(TARGET {TARGET} POST_BUILD
     COMMAND "${ARM_SIZE}" "$<TARGET_FILE_NAME:{TARGET}>"
     COMMENT "Creating {NAME}.hex"
 )
+
+# Build this target to flash the board, using whichever programmer is installed
+find_program(ST_LINK_CLI ST-LINK_CLI PATHS
+    "C:/Program Files (x86)/STMicroelectronics/STM32 ST-LINK Utility/ST-LINK Utility"
+    "C:/Program Files/STMicroelectronics/STM32 ST-LINK Utility/ST-LINK Utility"
+)
+find_program(ST_FLASH st-flash PATHS /opt/homebrew/bin /usr/local/bin)
+find_program(OPENOCD openocd PATHS /opt/homebrew/bin /usr/local/bin)
+if(ST_LINK_CLI)
+    set(FLASH_COMMAND "${ST_LINK_CLI}" -c SWD -P "{NAME}.hex" -V after_programming -Rst)
+elseif(ST_FLASH)
+    set(FLASH_COMMAND "${ST_FLASH}" --reset --format ihex write "{NAME}.hex")
+{OCD}else()
+    set(FLASH_COMMAND "${CMAKE_COMMAND}" -E echo "No programmer found: install ST-LINK Utility, stlink or OpenOCD" COMMAND "${CMAKE_COMMAND}" -E false)
+endif()
+add_custom_target(flash COMMAND ${FLASH_COMMAND} DEPENDS {TARGET} WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" USES_TERMINAL VERBATIM)
 '@
+    # OpenOCD names its chip configurations by family, unlike the other two programmers
+    $ocdBlock = ''
+    $ocdCfg = ''
+    if ((Get-Opt $t 'TargetOption/TargetCommonOption/Device') -match '^STM32(F[0-47]|G[04]|H7|L[0145]|U5|WB|WL)') {
+        $family = $Matches[1].ToLower()
+        $ocdCfg = if ($family -in 'l0', 'l1') { "stm32$family" } else { "stm32${family}x" }
+        $ocdBlock = "elseif(OPENOCD)`n    set(FLASH_COMMAND `"`${OPENOCD}`" -f interface/stlink.cfg -f target/$ocdCfg.cfg -c `"program {NAME}.hex verify reset exit`")`n"
+    }
+    $cmakeText = $cmakeText.Replace('{OCD}', $ocdBlock)
     $cmakeText = $cmakeText.Replace('{MARKER}', $Marker).Replace('{UVPROJX}', $uv[0].Name).Replace('{TARGET}', $target).Replace('{NAME}', $name).Replace('{DEVICE}', $deviceBlock)
     $cmakeText = $cmakeText.Replace('{SRC}', (Fmt $srcList)).Replace('{INCS}', (FmtC $incs)).Replace('{DEFS}', (FmtC $defs)).Replace('{COPT}', (FmtC $cOpt)).Replace('{LOPT}', (Fmt $linkOpt))
     Save-Text $outFile $cmakeText
+
+    # CLion's OpenOCD run configuration: Run flashes the board, Debug also stops at breakpoints
+    if ($ocdCfg) {
+        Save-Text (Join-Path $cmakeDir 'stlink.cfg') "# $Marker. Do not edit by hand.`nsource [find interface/stlink.cfg]`nsource [find target/$ocdCfg.cfg]`nreset_config none"
+        $runDir = Join-Path $dir '.run'
+        New-Item -ItemType Directory -Force $runDir | Out-Null
+        $runConfig = @'
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="OpenOCD" type="com.jetbrains.cidr.embedded.openocd.conf.type" factoryName="com.jetbrains.cidr.embedded.openocd.conf.factory" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="{TARGET}" TARGET_NAME="{TARGET}" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="{TARGET}" RUN_TARGET_NAME="{TARGET}">
+    <openocd board-config="$PROJECT_DIR$/cmake/stlink.cfg" gdb-port="3333" telnet-port="4444" reset-type="INIT" download-type="ALWAYS" />
+    <method v="2">
+      <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+    </method>
+  </configuration>
+</component>
+'@
+        Save-Text (Join-Path $runDir 'OpenOCD.run.xml') $runConfig.Replace('{TARGET}', $target)
+    }
 
     Write-Host "  完成: $($cSrc.Count) 个 C 文件, CPU $cpu, 宏 $((@($defs | Where-Object { $_ -notmatch '^\$' }) + $deviceDefine | Where-Object { $_ }) -join ' ')"
 }

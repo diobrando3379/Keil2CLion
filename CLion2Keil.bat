@@ -377,6 +377,10 @@ function Remove-CLionFiles($dir) {
     foreach ($b in Get-ChildItem -LiteralPath $dir -Directory -Filter 'cmake-build-*') { Remove-Item -LiteralPath $b.FullName -Recurse -Force }
     $idea = Join-Path $dir '.idea'
     if (Test-Path -LiteralPath $idea) { Remove-Item -LiteralPath $idea -Recurse -Force }
+    $runDir = Join-Path $dir '.run'
+    $runFile = Join-Path $runDir 'OpenOCD.run.xml'
+    if (Test-Path -LiteralPath $runFile) { Remove-Item -LiteralPath $runFile -Force }
+    if ((Test-Path -LiteralPath $runDir) -and -not @(Get-ChildItem -LiteralPath $runDir -Force).Count) { Remove-Item -LiteralPath $runDir -Force }
     $cmakeDir = Join-Path $dir 'cmake'
     if (Test-Path -LiteralPath $cmakeDir) {
         foreach ($f in Get-ChildItem -LiteralPath $cmakeDir -File) {
@@ -387,7 +391,7 @@ function Remove-CLionFiles($dir) {
         else { Remove-Item -LiteralPath $cmakeDir -Force }
     }
     Remove-Item -LiteralPath (Join-Path $dir 'CMakeLists.txt') -Force
-    Write-Host '  已删除 CLion 文件: cmake-build-*, .idea, cmake, CMakeLists.txt'
+    Write-Host '  已删除 CLion 文件: cmake-build-*, .idea, .run, cmake, CMakeLists.txt'
 }
 
 try {
