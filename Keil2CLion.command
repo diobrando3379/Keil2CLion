@@ -678,7 +678,7 @@ find_program(ST_LINK_CLI ST-LINK_CLI PATHS
 find_program(ST_FLASH st-flash PATHS /opt/homebrew/bin /usr/local/bin)
 find_program(OPENOCD openocd PATHS /opt/homebrew/bin /usr/local/bin)
 if(ST_LINK_CLI)
-    set(FLASH_COMMAND "${ST_LINK_CLI}" -c SWD -P "{NAME}.hex" -V after_programming -Rst)
+    set(FLASH_COMMAND "${ST_LINK_CLI}" -Q -c SWD -P "{NAME}.hex" -V after_programming -Rst)
 elseif(ST_FLASH)
     set(FLASH_COMMAND "${ST_FLASH}" --reset --format ihex write "{NAME}.hex")
 {OCD}else()
